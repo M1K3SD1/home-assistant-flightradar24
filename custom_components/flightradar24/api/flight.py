@@ -132,6 +132,7 @@ class FlightProcessor:
             for obj in flights:
                 self._update_flights_data(obj, current, self._tracked, FlightType.TRACKED)
                 current[obj.id]['tracked_type'] = 'live'
+                current[obj.id]['status'] = 'tracking'
                 if current[obj.id].get('flight_number'):
                     current_flights.append(current[obj.id].get('flight_number'))
                 if current[obj.id].get('callsign'):
@@ -156,6 +157,7 @@ class FlightProcessor:
                 else:
                     current[flight_id] = self._tracked[flight_id]
                     current[flight_id]['tracked_type'] = 'not_found'
+                    current[flight_id]['status'] = 'no_signal'
 
         self._tracked = current
 
@@ -189,14 +191,23 @@ class FlightProcessor:
             flight.callsign = found['detail']['callsign']
 
             self._update_flights_data(flight, current, self._tracked)
+            current[found.get('id')]['tracked_type'] = 'live'
+            current[found.get('id')]['status'] = 'tracking'
         else:
             current[found.get('id')] = {
                 'id': found.get('id'),
                 'callsign': found['detail'].get('callsign'),
                 'flight_number': found['detail'].get('flight'),
                 'aircraft_registration': None,
+                'altitude': 0,
+                'ground_speed': 0,
+                'vertical_speed': 0,
+                'heading': 0,
+                'latitude': None,
+                'longitude': None,
+                'status': 'scheduled',
             }
-        current[found.get('id')]['tracked_type'] = found.get('type')
+            current[found.get('id')]['tracked_type'] = found.get('type')
 
     def update_most_tracked(self) -> None:
         if self._most_tracked is None:
@@ -239,15 +250,16 @@ class FlightProcessor:
             current[flight['id']] = flight
             flight['latitude'] = obj.latitude
             flight['longitude'] = obj.longitude
-            flight['altitude'] = obj.altitude
-            flight['heading'] = obj.heading
-            flight['ground_speed'] = obj.ground_speed
-            flight['squawk'] = obj.squawk
-            flight['vertical_speed'] = obj.vertical_speed
+            flight['altitude'] = obj.altitude if obj.altitude is not None else 0
+            flight['heading'] = obj.heading if obj.heading is not None else 0
+            flight['ground_speed'] = obj.ground_speed if obj.ground_speed is not None else 0
+            flight['squawk'] = obj.squawk if obj.squawk else ''
+            flight['vertical_speed'] = obj.vertical_speed if obj.vertical_speed is not None else 0
             new_distance = obj.get_distance_from(self._point)
-            flight['distance'] = new_distance
-            flight['closest_distance'] = min(new_distance, flight.get('closest_distance', new_distance))
+            flight['distance'] = new_distance if new_distance is not None else 0
+            flight['closest_distance'] = min(new_distance if new_distance is not None else 0, flight.get('closest_distance', new_distance if new_distance is not None else 0))
             flight['on_ground'] = obj.on_ground
+            flight['status'] = 'tracking'
             self._takeoff_and_landing(flight, last_position, obj.on_ground, sensor_type)
 
     def _takeoff_and_landing(self,

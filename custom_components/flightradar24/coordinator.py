@@ -56,7 +56,9 @@ class FlightRadar24Coordinator(DataUpdateCoordinator[int]):
         try:
             found = await self.hass.async_add_executor_job(self.flight.add_track, number)
             if not found:
-                self.logger.error('FlightRadar24: Add Track - No flight found by - {}'.format(number))
+                self.logger.warning('FlightRadar24: Add Track - Flight "{}" not found in search results. It may not be airborne yet or the search is still in progress.'.format(number))
+            else:
+                self.logger.info('FlightRadar24: Successfully added "{}" to tracking'.format(number))
         except Exception as e:
             self.logger.error("FlightRadar24: %s", e)
 
