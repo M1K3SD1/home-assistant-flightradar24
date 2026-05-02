@@ -42,6 +42,9 @@ class FlightRadar24Coordinator(DataUpdateCoordinator[int]):
             name=DEFAULT_NAME,
         )
 
+        self._consecutive_errors = 0
+        self._max_errors_before_quiet = 3
+
         super().__init__(
             hass,
             logger,
@@ -92,8 +95,15 @@ class FlightRadar24Coordinator(DataUpdateCoordinator[int]):
             await self.hass.async_add_executor_job(self.flight.update_flights_tracked)
             await self.hass.async_add_executor_job(self.flight.update_most_tracked)
             await self.hass.async_add_executor_job(self.airport.update_airport_info)
+            self._consecutive_errors = 0
         except Exception as e:
-            self.logger.error("FlightRadar24: %s", e)
+            self._consecutive_errors += 1
+            if self._consecutive_errors <= self._max_errors_before_quiet:
+                self.logger.error("FlightRadar24: %s", e)
+                if self._consecutive_errors == self._max_errors_before_quiet:
+                    self.logger.warning("FlightRadar24: repeated errors — suppressing to debug")
+            else:
+                self.logger.debug("FlightRadar24: %s (consecutive #%d)", e, self._consecutive_errors)
 
         def fire(event: Event) -> None:
             self.hass.bus.fire(event.event, event.data)

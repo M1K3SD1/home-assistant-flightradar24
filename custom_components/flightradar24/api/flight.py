@@ -244,7 +244,79 @@ class FlightProcessor:
                 and to_int(last_position) == obj.on_ground):
             flight = tracked[obj.id]
         else:
-            data = self._client.get_flight_details(obj)
+            try:
+                data = self._client.get_flight_details(obj)
+            except Exception:
+                # Flight detail fetch failed (e.g. 404 stale ID, or 403 on
+                # clickhandler endpoint — FR24 upstream bug, see issue #201).
+                # Reuse cached data if available, otherwise fall back to the
+                # minimal data on the Flight object so the sensor still
+                # reflects what's in the area.
+                if tracked is not None and obj.id in tracked:
+                    flight = tracked[obj.id]
+                    flight['status'] = 'stale'
+                else:
+                    flight = {
+                        'id': obj.id,
+                        'flight_number': getattr(obj, 'number', None) or None,
+                        'callsign': getattr(obj, 'callsign', None) or None,
+                        'aircraft_registration': getattr(obj, 'registration', None) or None,
+                        'aircraft_photo_small': None,
+                        'aircraft_photo_medium': None,
+                        'aircraft_photo_large': None,
+                        'aircraft_model': None,
+                        'aircraft_code': getattr(obj, 'aircraft_code', None) or None,
+                        'airline': None,
+                        'airline_short': None,
+                        'airline_iata': getattr(obj, 'airline_iata', None) or None,
+                        'airline_icao': getattr(obj, 'airline_icao', None) or None,
+                        'airport_origin_name': None,
+                        'airport_origin_code_iata': getattr(obj, 'origin_airport_iata', None) or None,
+                        'airport_origin_code_icao': None,
+                        'airport_origin_country_name': None,
+                        'airport_origin_country_code': None,
+                        'airport_origin_city': None,
+                        'airport_origin_timezone_offset': None,
+                        'airport_origin_timezone_abbr': None,
+                        'airport_origin_terminal': None,
+                        'airport_origin_latitude': None,
+                        'airport_origin_longitude': None,
+                        'airport_destination_name': None,
+                        'airport_destination_code_iata': getattr(obj, 'destination_airport_iata', None) or None,
+                        'airport_destination_code_icao': None,
+                        'airport_destination_country_name': None,
+                        'airport_destination_country_code': None,
+                        'airport_destination_city': None,
+                        'airport_destination_timezone_offset': None,
+                        'airport_destination_timezone_abbr': None,
+                        'airport_destination_terminal': None,
+                        'airport_destination_latitude': None,
+                        'airport_destination_longitude': None,
+                        'time_scheduled_departure': None,
+                        'time_scheduled_arrival': None,
+                        'time_real_departure': None,
+                        'time_real_arrival': None,
+                        'time_estimated_departure': None,
+                        'time_estimated_arrival': None,
+                        'status': 'no_details',
+                    }
+                current[obj.id] = flight
+                flight['latitude'] = obj.latitude
+                flight['longitude'] = obj.longitude
+                flight['altitude'] = obj.altitude if obj.altitude is not None else 0
+                flight['heading'] = obj.heading if obj.heading is not None else 0
+                flight['ground_speed'] = obj.ground_speed if obj.ground_speed is not None else 0
+                flight['squawk'] = obj.squawk if obj.squawk else ''
+                flight['vertical_speed'] = obj.vertical_speed if obj.vertical_speed is not None else 0
+                new_distance = obj.get_distance_from(self._point)
+                flight['distance'] = new_distance if new_distance is not None else 0
+                flight['closest_distance'] = min(
+                    new_distance if new_distance is not None else 0,
+                    flight.get('closest_distance', new_distance if new_distance is not None else 0),
+                )
+                flight['on_ground'] = obj.on_ground
+                self._takeoff_and_landing(flight, last_position, obj.on_ground, sensor_type)
+                return
             flight = self._get_flight_data(data)
         if flight is not None:
             current[flight['id']] = flight
