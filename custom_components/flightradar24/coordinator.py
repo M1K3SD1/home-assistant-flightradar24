@@ -7,6 +7,8 @@ from .const import (
     DOMAIN,
     URL,
     DEFAULT_NAME,
+    CONF_AUTO_CLEANUP,
+    CONF_AUTO_CLEANUP_DEFAULT,
 )
 from .api.event import EventManager, Event
 from .api.flight import FlightProcessor
@@ -41,9 +43,6 @@ class FlightRadar24Coordinator(DataUpdateCoordinator[int]):
             manufacturer=DEFAULT_NAME,
             name=DEFAULT_NAME,
         )
-
-        self._consecutive_errors = 0
-        self._max_errors_before_quiet = 3
 
         super().__init__(
             hass,
@@ -86,24 +85,23 @@ class FlightRadar24Coordinator(DataUpdateCoordinator[int]):
                 await self.hass.async_add_executor_job(self.airport.set_track, code)
         except Exception as e:
             self.logger.error("FlightRadar24: %s", e)
+            return
+
+        self.async_set_updated_data(self.data)
 
     async def _async_update_data(self):
         if not self.scanning:
             return
+
+        self.flight._auto_cleanup = self.config_entry.data.get(CONF_AUTO_CLEANUP, CONF_AUTO_CLEANUP_DEFAULT)
+
         try:
             await self.hass.async_add_executor_job(self.flight.update_flights_in_area)
             await self.hass.async_add_executor_job(self.flight.update_flights_tracked)
             await self.hass.async_add_executor_job(self.flight.update_most_tracked)
             await self.hass.async_add_executor_job(self.airport.update_airport_info)
-            self._consecutive_errors = 0
         except Exception as e:
-            self._consecutive_errors += 1
-            if self._consecutive_errors <= self._max_errors_before_quiet:
-                self.logger.error("FlightRadar24: %s", e)
-                if self._consecutive_errors == self._max_errors_before_quiet:
-                    self.logger.warning("FlightRadar24: repeated errors — suppressing to debug")
-            else:
-                self.logger.debug("FlightRadar24: %s (consecutive #%d)", e, self._consecutive_errors)
+            self.logger.error("FlightRadar24: %s", e)
 
         def fire(event: Event) -> None:
             self.hass.bus.fire(event.event, event.data)

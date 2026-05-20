@@ -1,3 +1,4 @@
+import re
 from typing import Any
 from enum import Enum
 from FlightRadar24 import FlightRadar24API, Flight, Entity
@@ -11,8 +12,61 @@ from ..const import (
     EVENT_TRACKED_LANDED,
     EVENT_TRACKED_TOOK_OFF,
     EVENT_MOST_TRACKED_NEW,
+    EVENT_TRACKED_ARRIVED_GATE,
 )
 import pycountry
+
+
+def is_helicopter(flight) -> bool:
+    """Check if a flight is a helicopter based on callsign, model or ICAO code."""
+
+    def get_val(key):
+        return str(
+            flight.get(key, "")
+            if isinstance(flight, dict)
+            else getattr(flight, key, "") or ""
+        )
+
+    callsign = get_val("callsign")
+    model = get_val("aircraft_model")
+    code = get_val("aircraft_code")
+
+    if re.match(
+        (
+            r"^(LIFELN|POLICE|MEDIC|LL|HELI|SAR|SGR|ZULU|SLAYR|CRNGE|"
+            r"VORTX|SHARK|REAPER|APACHE|FIRE|RESCUE|PNTHR|VICTR|CHX|"
+            r"NHC|UKP|NPAS|AAC|AMBUSH|BARON|ARCTIC|COAST|KUST|RAINBOW|"
+            r"SAMU|DRAG|PEGASO|HEMS)"
+        ),
+        callsign,
+        re.IGNORECASE,
+    ):
+        return True
+
+    if re.search(
+        (
+            r"(HELICOPTER|EUROCOPTER|ROBINSON|AGUSTA|BELL\s|SIKORSKY|"
+            r"AEROSPATIALE|MD\sHELICOPTERS|GUIMBAL|KAMOV|LEONARDO|"
+            r"WESTLAND|APACHE|CHINOOK|GAZELLE|MERLIN|WILDCAT|LYNX|"
+            r"PUMA|BOEING\sAH|AH\-64)"
+        ),
+        model,
+        re.IGNORECASE,
+    ):
+        return True
+
+    if re.match(
+        (
+            r"^(R22|R44|R66|EC|AS[35]|H1[23467]|H6[045]|H47|AW|"
+            r"B[0245]|UH|CH|A1[0-9]|H500|MI[0-9]|NH90|SK[0-9]|"
+            r"EH10|LYNX|G2CA|S76|S92|EC45)"
+        ),
+        code,
+        re.IGNORECASE,
+    ):
+        return True
+
+    return False
 
 
 class FlightType(Enum):
@@ -22,7 +76,7 @@ class FlightType(Enum):
 
 class FlightProcessor:
     __slots__ = ('_in_area', '_tracked', '_most_tracked', '_entered', '_exited', '_min_altitude', '_max_altitude',
-                 '_point', '_client', '_bounds', '_event_manager')
+                 '_point', '_client', '_bounds', '_event_manager', '_auto_cleanup')
 
     def __init__(
             self,
@@ -32,6 +86,7 @@ class FlightProcessor:
             max_altitude: int,
             point: Entity,
             bounds: str,
+            auto_cleanup: bool = False,
     ) -> None:
         self._min_altitude = min_altitude
         self._max_altitude = max_altitude
@@ -39,6 +94,7 @@ class FlightProcessor:
         self._client = client
         self._bounds = bounds
         self._event_manager = event_manager
+        self._auto_cleanup = auto_cleanup
         self._in_area: dict[str, dict[str, Any]] | None = None
         self._tracked: dict[str, dict[str, Any]] = {}
         self._most_tracked: dict[str, dict[str, Any]] | None = None
@@ -159,6 +215,26 @@ class FlightProcessor:
                     current[flight_id]['tracked_type'] = 'not_found'
                     current[flight_id]['status'] = 'no_signal'
 
+        # --- AUTO-CLEANUP LOGIC WRAPPED IN CONFIG CHECK ---
+        if self._auto_cleanup:
+            keys_to_remove = []
+            for fid, new_data in current.items():
+                if new_data.get('tracked_type') == 'schedule':
+                    number = new_data.get('flight_number') or new_data.get('callsign')
+                    # Check if this flight was 'live' in our previous update
+                    for old_data in self._tracked.values():
+                        old_number = old_data.get('flight_number') or old_data.get('callsign')
+                        if old_number == number and old_data.get('tracked_type') == 'live':
+                            keys_to_remove.append(fid)
+                            # Fire an event to Home Assistant for automations!
+                            self._event_manager.add_events(EVENT_TRACKED_ARRIVED_GATE, [old_data])
+                            break
+
+            # Remove the landed flights from the current tracking list
+            for fid in keys_to_remove:
+                current.pop(fid, None)
+        # -------------------------------------------------------------------
+
         self._tracked = current
 
     def _find_flight(self, current: dict[str, dict[str, Any]], number: str) -> None:
@@ -239,84 +315,16 @@ class FlightProcessor:
                              tracked: dict[str, dict[str, Any]],
                              sensor_type: FlightType | None = None,
                              ) -> None:
-        last_position = tracked[obj.id].get('on_ground') if tracked is not None and obj.id in tracked else None
+        previous_flight = tracked.get(obj.id) if tracked is not None else None
+        last_position = previous_flight.get('on_ground') if previous_flight is not None else None
+        previous_closest_distance = (
+            previous_flight.get('closest_distance') if previous_flight is not None else None
+        )
         if (tracked is not None and obj.id in tracked and self._is_valid(tracked[obj.id])
                 and to_int(last_position) == obj.on_ground):
             flight = tracked[obj.id]
         else:
-            try:
-                data = self._client.get_flight_details(obj)
-            except Exception:
-                # Flight detail fetch failed (e.g. 404 stale ID, or 403 on
-                # clickhandler endpoint — FR24 upstream bug, see issue #201).
-                # Reuse cached data if available, otherwise fall back to the
-                # minimal data on the Flight object so the sensor still
-                # reflects what's in the area.
-                if tracked is not None and obj.id in tracked:
-                    flight = tracked[obj.id]
-                    flight['status'] = 'stale'
-                else:
-                    flight = {
-                        'id': obj.id,
-                        'flight_number': getattr(obj, 'number', None) or None,
-                        'callsign': getattr(obj, 'callsign', None) or None,
-                        'aircraft_registration': getattr(obj, 'registration', None) or None,
-                        'aircraft_photo_small': None,
-                        'aircraft_photo_medium': None,
-                        'aircraft_photo_large': None,
-                        'aircraft_model': None,
-                        'aircraft_code': getattr(obj, 'aircraft_code', None) or None,
-                        'airline': None,
-                        'airline_short': None,
-                        'airline_iata': getattr(obj, 'airline_iata', None) or None,
-                        'airline_icao': getattr(obj, 'airline_icao', None) or None,
-                        'airport_origin_name': None,
-                        'airport_origin_code_iata': getattr(obj, 'origin_airport_iata', None) or None,
-                        'airport_origin_code_icao': None,
-                        'airport_origin_country_name': None,
-                        'airport_origin_country_code': None,
-                        'airport_origin_city': None,
-                        'airport_origin_timezone_offset': None,
-                        'airport_origin_timezone_abbr': None,
-                        'airport_origin_terminal': None,
-                        'airport_origin_latitude': None,
-                        'airport_origin_longitude': None,
-                        'airport_destination_name': None,
-                        'airport_destination_code_iata': getattr(obj, 'destination_airport_iata', None) or None,
-                        'airport_destination_code_icao': None,
-                        'airport_destination_country_name': None,
-                        'airport_destination_country_code': None,
-                        'airport_destination_city': None,
-                        'airport_destination_timezone_offset': None,
-                        'airport_destination_timezone_abbr': None,
-                        'airport_destination_terminal': None,
-                        'airport_destination_latitude': None,
-                        'airport_destination_longitude': None,
-                        'time_scheduled_departure': None,
-                        'time_scheduled_arrival': None,
-                        'time_real_departure': None,
-                        'time_real_arrival': None,
-                        'time_estimated_departure': None,
-                        'time_estimated_arrival': None,
-                        'status': 'no_details',
-                    }
-                current[obj.id] = flight
-                flight['latitude'] = obj.latitude
-                flight['longitude'] = obj.longitude
-                flight['altitude'] = obj.altitude if obj.altitude is not None else 0
-                flight['heading'] = obj.heading if obj.heading is not None else 0
-                flight['ground_speed'] = obj.ground_speed if obj.ground_speed is not None else 0
-                flight['squawk'] = obj.squawk if obj.squawk else ''
-                flight['vertical_speed'] = obj.vertical_speed if obj.vertical_speed is not None else 0
-                new_distance = obj.get_distance_from(self._point)
-                flight['distance'] = new_distance if new_distance is not None else 0
-                flight['closest_distance'] = min(
-                    new_distance if new_distance is not None else 0,
-                    flight.get('closest_distance', new_distance if new_distance is not None else 0),
-                )
-                flight['on_ground'] = obj.on_ground
-                self._takeoff_and_landing(flight, last_position, obj.on_ground, sensor_type)
-                return
+            data = self._client.get_flight_details(obj)
             flight = self._get_flight_data(data)
         if flight is not None:
             current[flight['id']] = flight
@@ -327,9 +335,13 @@ class FlightProcessor:
             flight['ground_speed'] = obj.ground_speed if obj.ground_speed is not None else 0
             flight['squawk'] = obj.squawk if obj.squawk else ''
             flight['vertical_speed'] = obj.vertical_speed if obj.vertical_speed is not None else 0
+            flight['aircraft_icao_24bit'] = getattr(obj, 'icao_24bit', '')
             new_distance = obj.get_distance_from(self._point)
             flight['distance'] = new_distance if new_distance is not None else 0
-            flight['closest_distance'] = min(new_distance if new_distance is not None else 0, flight.get('closest_distance', new_distance if new_distance is not None else 0))
+            flight['closest_distance'] = min(
+                new_distance if new_distance is not None else 0,
+                previous_closest_distance if previous_closest_distance is not None else (new_distance if new_distance is not None else 0),
+            )
             flight['on_ground'] = obj.on_ground
             flight['status'] = 'tracking'
             self._takeoff_and_landing(flight, last_position, obj.on_ground, sensor_type)
@@ -412,6 +424,15 @@ class FlightProcessor:
             'time_estimated_arrival': get_value(flight, ['time', 'estimated', 'arrival']),
         }
 
+    # --- IMPLEMENTED ALEXANDR'S FIX HERE ---
     def _is_valid(self, flight: dict) -> bool:
-        return all(flight.get(f) is not None for f in ['flight_number', 'time_scheduled_departure',
-                                                       'time_estimated_arrival'])
+        if is_helicopter(flight):
+            return flight.get("id") is not None
+
+        required_fields = [
+            "flight_number",
+            "time_scheduled_departure",
+            "time_estimated_arrival",
+        ]
+
+        return all(flight.get(f) is not None for f in required_fields)
